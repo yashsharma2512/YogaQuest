@@ -1,32 +1,61 @@
 import cv2
 import os
-from PyQt6.QtWidgets import QWidget, QLabel, QVBoxLayout, QHBoxLayout, QComboBox, QPushButton
+import datetime
+import numpy as np
+import matplotlib.pyplot as plt
+
+from PyQt6.QtWidgets import (
+    QWidget, QLabel, QVBoxLayout,
+    QHBoxLayout, QComboBox, QPushButton,
+    QFileDialog, QFrame
+)
 from PyQt6.QtCore import QTimer, QUrl, Qt
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtGui import QImage, QPixmap, QFont
 from PyQt6.QtMultimedia import QSoundEffect
 
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
+
 from engine.pose_detector import PoseDetector
-from engine.scoring_engine import score_pose
+from engine.ml_pose_classifier import classify_pose_ml
+from engine.scoring_engine import hybrid_score, detect_fatigue
 from ui.results_window import ResultsWindow
-from utils.session_manager import save_session
 
 
 class TrainingWindow(QWidget):
     def __init__(self):
         super().__init__()
 
+        self.setWindowTitle("YogaQuest AI")
+
         # ================= STYLE =================
         self.setStyleSheet("""
-            QWidget { background-color: #0D0D0D; color: white; font-family: Segoe UI; }
-            QPushButton { background:#1F1F1F; border-radius:10px; padding:10px; }
-            QPushButton:hover { background:#2A2A2A; }
-            QComboBox { background:#1F1F1F; padding:6px; border-radius:8px; }
+            QWidget {
+                background-color: #0F172A;
+                color: white;
+                font-family: Segoe UI;
+            }
+            QPushButton {
+                background-color: #1E293B;
+                border-radius: 10px;
+                padding: 8px;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+            }
+            QComboBox {
+                background-color: #1E293B;
+                padding: 6px;
+                border-radius: 6px;
+            }
         """)
 
         # ================= STATE =================
         self.cap = None
         self.running = False
         self.session_scores = []
+        self.session_summary = {}
 
         # ================= TIMERS =================
         self.frame_timer = QTimer()
@@ -37,14 +66,16 @@ class TrainingWindow(QWidget):
 
         # ================= SOUND =================
         self.sound = QSoundEffect()
-        sound_path = os.path.abspath("assets/success.wav")
-        self.sound.setSource(QUrl.fromLocalFile(sound_path))
-        self.sound.setVolume(1.0)
+        self.sound.setSource(QUrl.fromLocalFile(
+            os.path.abspath("assets/success.wav")
+        ))
 
         # ================= CAMERA =================
         self.camera_label = QLabel()
-        self.camera_label.setFixedSize(640, 400)
-        self.camera_label.setStyleSheet("background:black;border-radius:12px;")
+        self.camera_label.setMinimumSize(640, 400)
+        self.camera_label.setStyleSheet(
+            "background-color:black;border-radius:15px;"
+        )
 
         # ================= CONTROLS =================
         self.pose_selector = QComboBox()
@@ -64,51 +95,58 @@ class TrainingWindow(QWidget):
         self.stop_btn = QPushButton("⏹ Stop")
         self.stop_btn.clicked.connect(self.stop_session)
 
-        self.back_btn = QPushButton("← Home")
-        self.back_btn.clicked.connect(self.go_home)
+        self.export_btn = QPushButton("📄 Export PDF")
+        self.export_btn.clicked.connect(self.export_pdf)
 
-        # ================= LABELS =================
-        self.score_label = QLabel("⭐ 0")
-        self.score_label.setStyleSheet("font-size: 20px;")
+        # ================= METRICS =================
+        self.score_label = QLabel("Score: 0")
+        self.score_label.setFont(QFont("Segoe UI", 18))
 
-        self.timer_label = QLabel("⏳ 0s")
-        self.timer_label.setStyleSheet("font-size: 16px;")
-
-        self.feedback_label = QLabel("🎯 Feedback")
+        self.timer_label = QLabel("Time: 0")
+        self.fatigue_label = QLabel("Fatigue: No")
+        self.feedback_label = QLabel("Feedback")
         self.feedback_label.setWordWrap(True)
 
-        # ================= LAYOUT =================
-        right = QVBoxLayout()
-        right.addWidget(self.back_btn)
-        right.addWidget(QLabel("Pose"))
-        right.addWidget(self.pose_selector)
-        right.addWidget(QLabel("Duration"))
-        right.addWidget(self.duration_selector)
-        right.addWidget(self.start_btn)
-        right.addWidget(self.stop_btn)
-        right.addSpacing(10)
-        right.addWidget(self.score_label)
-        right.addWidget(self.timer_label)
-        right.addWidget(self.feedback_label)
-        right.addStretch()
+        # ================= RIGHT CARD =================
+        card = QFrame()
+        card.setStyleSheet("""
+            QFrame {
+                background-color: #111827;
+                border-radius: 15px;
+                padding: 12px;
+            }
+        """)
 
-        main = QHBoxLayout()
-        main.addWidget(self.camera_label)
-        main.addLayout(right)
+        right_layout = QVBoxLayout(card)
+        right_layout.addWidget(QLabel("Pose"))
+        right_layout.addWidget(self.pose_selector)
+        right_layout.addWidget(QLabel("Duration"))
+        right_layout.addWidget(self.duration_selector)
+        right_layout.addWidget(self.start_btn)
+        right_layout.addWidget(self.stop_btn)
+        right_layout.addWidget(self.export_btn)
+        right_layout.addSpacing(10)
+        right_layout.addWidget(self.score_label)
+        right_layout.addWidget(self.timer_label)
+        right_layout.addWidget(self.fatigue_label)
+        right_layout.addWidget(self.feedback_label)
+        right_layout.addStretch()
 
-        self.setLayout(main)
+        # ================= MAIN LAYOUT =================
+        main_layout = QHBoxLayout()
+        main_layout.addWidget(self.camera_label, 3)
+        main_layout.addWidget(card, 1)
 
-        # ================= ENGINE =================
+        self.setLayout(main_layout)
+
         self.pose_detector = PoseDetector()
-        self.back_to_home = None
 
     # ================= START =================
     def start_session(self):
         if self.running:
             return
 
-        self.cap = cv2.VideoCapture('planks.mp4')
-
+        self.cap = cv2.VideoCapture('tree.mp4')  # Use 0 for webcam or path to video file
         self.session_scores = []
         self.remaining_time = int(self.duration_selector.currentText())
         self.running = True
@@ -121,21 +159,15 @@ class TrainingWindow(QWidget):
         if self.running:
             self.end_session()
 
-    # ================= BACK =================
-    def go_home(self):
-        self.stop_session()
-        if self.back_to_home:
-            self.back_to_home()
-
     # ================= TIMER =================
     def update_countdown(self):
         self.remaining_time -= 1
-        self.timer_label.setText(f"⏳ {self.remaining_time}s")
+        self.timer_label.setText(f"Time: {self.remaining_time}s")
 
         if self.remaining_time <= 0:
             self.end_session()
 
-    # ================= FRAME =================
+    # ================= FRAME UPDATE =================
     def update_frame(self):
         if not self.running:
             return
@@ -147,58 +179,113 @@ class TrainingWindow(QWidget):
         frame, landmarks = self.pose_detector.detect(frame)
 
         pose = self.pose_selector.currentText()
-        score, feedback, errors = score_pose(pose, landmarks)
+        ml_pose, ml_conf = classify_pose_ml(landmarks)
+
+        score, feedback, errors, conf = hybrid_score(
+            pose, landmarks, ml_pose, ml_conf
+        )
 
         self.session_scores.append(score)
 
-        # ===== UI UPDATE =====
-        self.score_label.setText(f"⭐ {score}")
+        fatigue = detect_fatigue(self.session_scores)
 
-        if feedback:
-            self.feedback_label.setText("🎯 " + ", ".join(feedback))
-        else:
-            self.feedback_label.setText("🎯 Perfect!")
+        self.score_label.setText(f"Score: {score}")
+        self.feedback_label.setText(
+            ", ".join(feedback) if feedback else "Perfect"
+        )
+        self.fatigue_label.setText(
+            "Fatigue: YES ⚠️" if fatigue else "Fatigue: No"
+        )
 
-        # ===== JOINT HIGHLIGHT =====
-        if landmarks:
-            h, w, _ = frame.shape
-
-            # Red = incorrect joints
-            for idx in errors:
-                x = int(landmarks[idx].x * w)
-                y = int(landmarks[idx].y * h)
-                cv2.circle(frame, (x, y), 10, (0, 0, 255), -1)
-
-        # ===== FIXED CAMERA DISPLAY (NO CROPPING) =====
+        # ===== DISPLAY FRAME PROPERLY SCALED =====
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
-
         scale = min(640 / w, 400 / h)
-        new_w = int(w * scale)
-        new_h = int(h * scale)
+        resized = cv2.resize(rgb, (int(w * scale), int(h * scale)))
 
-        resized = cv2.resize(rgb, (new_w, new_h))
+        qt_img = QImage(
+            resized.data,
+            resized.shape[1],
+            resized.shape[0],
+            resized.shape[2] * resized.shape[1],
+            QImage.Format.Format_RGB888
+        )
 
-        qt_img = QImage(resized.data, new_w, new_h, ch * new_w, QImage.Format.Format_RGB888)
         self.camera_label.setPixmap(QPixmap.fromImage(qt_img))
         self.camera_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-    # ================= END =================
+    # ================= END SESSION =================
     def end_session(self):
+
+        if not self.running:
+            return
+
+        self.running = False
+
         self.frame_timer.stop()
         self.session_timer.stop()
-        self.running = False
 
         if self.cap:
             self.cap.release()
+            self.cap = None
 
-        # ===== SAVE SESSION =====
-        if self.session_scores:
-            save_session(self.session_scores)
+        if not self.session_scores:
+            return
 
-        # ===== SOUND =====
+        self.session_summary = {
+            "date": str(datetime.datetime.now()),
+            "pose": self.pose_selector.currentText(),
+            "average": float(np.mean(self.session_scores)),
+            "max": max(self.session_scores),
+            "min": min(self.session_scores),
+            "fatigue": detect_fatigue(self.session_scores)
+        }
+
         self.sound.play()
 
-        # ===== RESULTS =====
-        self.results = ResultsWindow(self.session_scores)
-        self.results.show()
+        self.results_window = ResultsWindow(self.session_scores)
+        self.results_window.show()
+
+    # ================= PDF EXPORT =================
+    def export_pdf(self):
+
+        if not self.session_scores:
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save PDF Report",
+            "Yoga_Report.pdf",
+            "PDF Files (*.pdf)"
+        )
+
+        if not file_path:
+            return
+
+        graph_path = "temp_graph.png"
+        plt.figure()
+        plt.plot(self.session_scores)
+        plt.title("Session Performance")
+        plt.xlabel("Frame")
+        plt.ylabel("Score")
+        plt.savefig(graph_path)
+        plt.close()
+
+        doc = SimpleDocTemplate(file_path)
+        elements = []
+        styles = getSampleStyleSheet()
+
+        elements.append(Paragraph("YogaQuest AI Report", styles["Title"]))
+        elements.append(Spacer(1, 0.3 * inch))
+
+        for key, value in self.session_summary.items():
+            elements.append(
+                Paragraph(f"<b>{key}:</b> {value}", styles["Normal"])
+            )
+            elements.append(Spacer(1, 0.2 * inch))
+
+        elements.append(Image(graph_path, width=5 * inch, height=3 * inch))
+
+        doc.build(elements)
+
+        os.remove(graph_path)
