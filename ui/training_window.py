@@ -146,7 +146,7 @@ class TrainingWindow(QWidget):
         if self.running:
             return
 
-        self.cap = cv2.VideoCapture('tree.mp4')  # Use 0 for webcam or path to video file
+        self.cap = cv2.VideoCapture(0)  # Use 0 for webcam or path to video file
         self.session_scores = []
         self.remaining_time = int(self.duration_selector.currentText())
         self.running = True
